@@ -169,6 +169,9 @@ class MemPalaceProvider(MemoryProvider):
         self._max_prefetch_chars = int(self._config.get("max_prefetch_chars", 4000))
         self._wing = self._config.get("wing", "sessions")
         self._session_id: str = ""
+        # Adaptive threshold state — tracks last 10 injection decisions
+        self._injection_history: List[bool] = []  # True=injected, False=skipped
+        self._inject_count: int = 0  # total injections this session
 
     # -- MemoryProvider ABC ------------------------------------------------
 
@@ -220,25 +223,38 @@ class MemPalaceProvider(MemoryProvider):
             # 3. Freshness boosting — recent sessions get score multiplier
             self._boost_freshness(results)
 
-            # 4. Dynamic threshold — skip injection if matches are weak
-            if not self._should_inject(results):
+            # 4. Adaptive threshold — skip injection if matches are weak (auto-tunes)
+            injected = self._should_inject(results)
+            self._injection_history.append(injected)
+            if len(self._injection_history) > 10:
+                self._injection_history.pop(0)
+
+            if not injected:
                 return ""
+
+            self._inject_count += 1
 
             # 5. Sort by room priority (decisions > problems > architecture > general > technical)
             room_order = {r: i for i, r in enumerate(self._PRIORITY_ROOMS)}
             results.sort(key=lambda r: (room_order.get(r.get("room", ""), 99), -(r.get("score", 0))))
 
-            # 6. Format with char budget
-            prefetch_text = self._format_prefetch(results)
+            # 6. Smart snippet — 1-2 sentence summary per result for quick scanning
+            sources = self._extract_keyword_snippets(results, search_query, max_sentences=2, max_chars=200)
+
+            # 7. Format with confidence metadata + snippets
+            prefetch_text = self._format_prefetch_with_meta(search_query, results, sources)
+
+            # 8. Enforce char budget
             if len(prefetch_text) > self._max_prefetch_chars:
                 prefetch_text = prefetch_text[:self._max_prefetch_chars] + "\n\n... (budget limit)"
 
             logger.debug(
-                "MemPalace prefetch: query='%s' top_score=%.3f results=%d chars=%d",
+                "MemPalace prefetch: query='%s' top=%.3f results=%d chars=%d total_injects=%d",
                 search_query[:80],
                 results[0]["score"] if results else 0,
                 len(results),
                 len(prefetch_text),
+                self._inject_count,
             )
             return prefetch_text
         except Exception as e:
@@ -599,14 +615,19 @@ class MemPalaceProvider(MemoryProvider):
                 pass
 
     # ------------------------------------------------------------------
-    # Dynamic threshold: skip injection for weak matches
+    # Adaptive threshold: auto-tunes injection sensitivity
     # ------------------------------------------------------------------
 
     def _should_inject(self, results: List[Dict[str, Any]]) -> bool:
         """Decide whether prefetch results are strong enough to inject.
 
+        Auto-tunes thresholds based on recent history:
+        - If most recent queries were skipped → loosen (surface more)
+        - If most recent queries were injected → tighten (save tokens)
+        - Otherwise use base thresholds
+
         Returns True only when results are likely to be actually useful.
-        Saves 4000 chars (~1000 tokens) per turn when nothing matches.
+        Saves ~1000 tokens per turn when nothing matches.
         """
         if not results:
             return False
@@ -615,18 +636,40 @@ class MemPalaceProvider(MemoryProvider):
         top = scores[0]
         avg = sum(scores) / len(scores) if scores else 0
 
+        # Determine adaptive bias from recent history
+        recent = self._injection_history[-10:] if self._injection_history else []
+        skipped_count = sum(1 for v in recent if not v)
+        injected_count = sum(1 for v in recent if v)
+
+        # Base thresholds
+        single_threshold = 0.55
+        multi_top = 0.45
+        multi_avg = 0.40
+
+        if len(recent) >= 5:
+            if skipped_count >= 7:  # mostly missing → loosen
+                single_threshold = 0.50
+                multi_top = 0.40
+                multi_avg = 0.35
+                logger.debug("MemPalace threshold: LOOSENED (skipped=%d/10)", skipped_count)
+            elif injected_count >= 9:  # mostly injecting → tighten
+                single_threshold = 0.60
+                multi_top = 0.50
+                multi_avg = 0.45
+                logger.debug("MemPalace threshold: TIGHTENED (injected=%d/10)", injected_count)
+
         # Strong single match
-        if top >= 0.55:
+        if top >= single_threshold:
             return True
 
         # Multiple moderate matches
-        if top >= 0.45 and len(results) >= 2 and avg >= 0.40:
+        if top >= multi_top and len(results) >= 2 and avg >= multi_avg:
             return True
 
         # Otherwise: skip — not worth the token burn
         logger.debug(
-            "MemPalace prefetch skipped: top_score=%.3f avg=%.3f results=%d",
-            top, avg, len(results),
+            "MemPalace prefetch skipped: top=%.3f avg=%.3f results=%d threshold=%.2f",
+            top, avg, len(results), single_threshold,
         )
         return False
 
@@ -749,32 +792,125 @@ class MemPalaceProvider(MemoryProvider):
         return results[:limit]
 
     @staticmethod
-    def _format_prefetch(results: List[Dict[str, Any]]) -> str:
+    def _format_prefetch_with_meta(
+        query: str,
+        results: List[Dict[str, Any]],
+        sources: Dict[str, str],
+    ) -> str:
+        """Format results with confidence metadata + keyword snippets.
+
+        Produces a compact format that tells the agent:
+        - How confident the match is (scores, source count)
+        - What the most relevant sentence is (snippet)
+        - The full content below for deeper context
+        """
         if not results:
             return ""
 
-        lines = ["## MemPalace Recall"]
+        scores = [r.get("score", 0) for r in results]
+        top_score = scores[0]
+        avg_score = round(sum(scores) / len(scores), 3) if scores else 0
+        room_dist = {}
+        for r in results:
+            room = r.get("room", "?")
+            room_dist[room] = room_dist.get(room, 0) + 1
+
+        confidence = "high" if top_score >= 0.58 else "medium" if top_score >= 0.48 else "low"
+
+        lines = [
+            "## MemPalace Recall",
+            f"> query: \"{query}\" | confidence: {confidence} ({len(results)} sources, top={top_score:.2f}, avg={avg_score:.2f})",
+            f"> rooms: {', '.join(f'{room}({n})' for room, n in sorted(room_dist.items()))}",
+            "",
+        ]
+
         for r in results:
             score = r.get("score", 0)
-            source = r.get("source", "unknown")
+            source = r.get("source", "?")
             room = r.get("room", "")
             wing = r.get("wing", "")
             content = r.get("content", "")
 
+            # Get the snippet for this source
+            snippet = sources.get(source, "")
+
             scope = f"{wing}/{room}" if wing and room else wing or room or ""
-            header = f"[{score:.2f}] {scope}" if scope else f"[{score:.2f}]"
-            if source:
-                header += f" ({source})"
+            header = f"[{score:.2f}] {scope}"
+            freshness = r.get("_freshness", "")
+            if freshness:
+                header += f" ({freshness})"
 
-            lines.append(f"\n### {header}")
+            lines.append(f"### {header} | {source}")
+            if snippet:
+                lines.append(f"> {snippet}")
+                lines.append("")
 
-            max_len = 2000
-            trimmed = content[:max_len] if len(content) > max_len else content
-            if len(content) > max_len:
+            # Content (trimmed per result)
+            max_content = 1500
+            trimmed = content[:max_content] if len(content) > max_content else content
+            if len(content) > max_content:
                 trimmed += "\n... (truncated)"
             lines.append(trimmed)
 
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Smart snippet: extract most keyword-relevant sentences
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _extract_keyword_snippets(
+        cls,
+        results: List[Dict[str, Any]],
+        query: str,
+        max_sentences: int = 2,
+        max_chars: int = 200,
+    ) -> Dict[str, str]:
+        """Extract 1-2 most query-relevant sentences from each result.
+
+        Uses keyword-density heuristic — sentences that share the most
+        unique terms with the query get selected. No model needed.
+
+        Returns a dict mapping source → snippet string.
+        """
+        # Tokenize query keywords
+        q_tokens = set(re.findall(r'[a-zA-Z0-9]{3,}', query.lower()))
+
+        snippets: Dict[str, str] = {}
+        if not q_tokens:
+            return snippets
+
+        for r in results:
+            content = r.get("content", "")
+            source = r.get("source", "")
+            if not content or not source:
+                continue
+
+            # Split into sentences (rough: ., ?, !, newlines)
+            sentences = re.split(r'(?<=[.!?])\s+|\n+', content)
+            if not sentences:
+                continue
+
+            # Score each sentence by keyword overlap
+            scored: List[tuple] = []
+            for sent in sentences:
+                sent = sent.strip()
+                if len(sent) < 15 or len(sent) > 300:
+                    continue
+                s_tokens = set(re.findall(r'[a-zA-Z0-9]{3,}', sent.lower()))
+                overlap = len(q_tokens & s_tokens)
+                if overlap > 0:
+                    scored.append((overlap, sent))
+
+            if scored:
+                scored.sort(key=lambda x: -x[0])
+                best = [s[1] for s in scored[:max_sentences]]
+                snippet = " ".join(best)
+                if len(snippet) > max_chars:
+                    snippet = snippet[:max_chars] + "..."
+                snippets[source] = snippet
+
+        return snippets
 
 
 # ---------------------------------------------------------------------------
