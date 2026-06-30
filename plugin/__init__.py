@@ -172,6 +172,8 @@ class MemPalaceProvider(MemoryProvider):
         # Adaptive threshold state — tracks last 10 injection decisions
         self._injection_history: List[bool] = []  # True=injected, False=skipped
         self._inject_count: int = 0  # total injections this session
+        # Query context — recent messages for query expansion
+        self._recent_queries: List[str] = []  # last 3 user messages (keywords only)
 
     # -- MemoryProvider ABC ------------------------------------------------
 
@@ -214,8 +216,8 @@ class MemPalaceProvider(MemoryProvider):
             return ""
 
         try:
-            # 1. Extract keywords for better semantic search signal
-            search_query = self._extract_keywords(query)
+            # 1. Expand short follow-ups with recent context keywords
+            search_query = self._expand_query(query)
 
             # 2. Room-targeted search: high-signal rooms first, fall back to technical
             results = self._targeted_search(search_query)
@@ -272,7 +274,13 @@ class MemPalaceProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        pass  # read-only — writes happen through mempalace mine
+        # Capture recent user keywords for query expansion
+        if user_content and len(user_content) > 5:
+            keywords = self._extract_keywords(user_content)
+            if keywords:
+                self._recent_queries.append(keywords)
+                if len(self._recent_queries) > 3:
+                    self._recent_queries.pop(0)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [MEMPALACE_SEARCH_SCHEMA]
@@ -515,8 +523,8 @@ class MemPalaceProvider(MemoryProvider):
         tokens = re.findall(r'[a-zA-Z0-9_-]+', query.lower())
         kept = [t for t in tokens if t not in cls._FILLER_WORDS and len(t) > 1]
 
-        # If stripping gutted the query, return original
-        if len(kept) < 2:
+        # If stripping gutted the query completely, return original
+        if len(kept) < 1:
             return query
 
         # Deduplicate while preserving order
@@ -528,6 +536,51 @@ class MemPalaceProvider(MemoryProvider):
                 unique.append(t)
 
         return ' '.join(unique[:max_words])
+
+    # ------------------------------------------------------------------
+    # Query expansion: enrich short/ambiguous queries with recent context
+    # ------------------------------------------------------------------
+
+    def _expand_query(self, query: str) -> str:
+        """Build an expanded search query from current + recent context.
+
+        When a user says "fix it" or "yes go ahead", the current query has
+        almost no semantic signal. This merges keywords from the last 1-3
+        messages to reconstruct the topic.
+
+        Returns the expanded query string.
+        """
+        current_keywords = self._extract_keywords(query)
+
+        # Expansion trigger: raw query < 40 chars = likely follow-up
+        # (Avoid relying on keyword count — filler-heavy queries break that)
+        if len(query) >= 40 or not self._recent_queries:
+            return current_keywords
+
+        # Collect unique keywords from recent context (newest first)
+        all_recent: List[str] = []
+        seen: set = set()
+        curr_tokens = set(current_keywords.lower().split())
+        for rq in reversed(self._recent_queries):
+            for token in rq.split():
+                if token not in seen and token not in curr_tokens:
+                    seen.add(token)
+                    all_recent.append(token)
+
+        if not all_recent:
+            return current_keywords
+
+        # Cap: 8 keywords from context
+        context_part = ' '.join(all_recent[:8])
+
+        # Only append current keywords if they're not pure filler
+        if current_keywords.strip().lower() != query.strip().lower():
+            expanded = f"{context_part} {current_keywords}"
+        else:
+            expanded = context_part
+
+        logger.debug("MemPalace query expanded: '%s' → '%s'", query, expanded)
+        return expanded
 
     # ------------------------------------------------------------------
     # Room priority: high-signal rooms first
