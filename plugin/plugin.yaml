@@ -1,0 +1,8 @@
+name: mempalace
+version: 0.1.0
+description: "MemPalace memory — semantic search over past conversation sessions via ChromaDB. Zero-config local recall without external services."
+pip_dependencies: []
+external_dependencies:
+  - name: mempalace
+    check: mempalace --help
+    install: "pip install mempalace"
