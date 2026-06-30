@@ -2,10 +2,10 @@
 # install.sh — Install mempalace-hermes plugin and optional cron mining.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/<user>/mempalace-hermes/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ipawanktiwari/mempalace-hermes/main/install.sh | bash
 #
 #   # Or clone and run:
-#   git clone https://github.com/<user>/mempalace-hermes.git
+#   git clone https://github.com/ipawanktiwari/mempalace-hermes.git
 #   cd mempalace-hermes && bash install.sh
 #
 # Options (environment variables):
