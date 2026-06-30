@@ -159,6 +159,7 @@ class MemPalaceProvider(MemoryProvider):
         self._timeout = int(self._config.get("timeout", 30))
         self._deduplicate = self._config.get("deduplicate", True) not in (False, "false", "False")
         self._max_prefetch_chars = int(self._config.get("max_prefetch_chars", 4000))
+        self._wing = self._config.get("wing", "sessions")
         self._session_id: str = ""
 
     # -- MemoryProvider ABC ------------------------------------------------
@@ -201,7 +202,7 @@ class MemPalaceProvider(MemoryProvider):
         if not query or not query.strip() or not self._binary:
             return ""
         try:
-            results = self._search(query, limit=self._default_results)
+            results = self._search(query, wing=self._wing, limit=self._default_results)
             results = self._process_results(results)
             if not results:
                 return ""
@@ -276,6 +277,11 @@ class MemPalaceProvider(MemoryProvider):
                 "env_var": "MEMALACE_BINARY",
             },
             {
+                "key": "wing",
+                "description": "MemPalace wing to search (default: sessions)",
+                "default": "sessions",
+            },
+            {
                 "key": "results",
                 "description": "Default number of results per search",
                 "default": "5",
@@ -324,6 +330,7 @@ class MemPalaceProvider(MemoryProvider):
             self._timeout = int(values.get("timeout", 30))
             self._deduplicate = values.get("deduplicate", True) not in (False, "false", "False")
             self._max_prefetch_chars = int(values.get("max_prefetch_chars", 4000))
+            self._wing = values.get("wing", "sessions")
         except Exception as e:
             logger.warning("Failed to save mempalace config: %s", e)
 
