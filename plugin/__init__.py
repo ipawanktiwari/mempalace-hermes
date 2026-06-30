@@ -174,6 +174,10 @@ class MemPalaceProvider(MemoryProvider):
         self._inject_count: int = 0  # total injections this session
         # Query context — recent messages for query expansion
         self._recent_queries: List[str] = []  # last 3 user messages (keywords only)
+        # Batched summary state — avoid per-turn log spam
+        self._summary_skips: int = 0
+        self._summary_injects: int = 0
+        self._summary_chars: int = 0
 
     # -- MemoryProvider ABC ------------------------------------------------
 
@@ -232,10 +236,12 @@ class MemPalaceProvider(MemoryProvider):
                 self._injection_history.pop(0)
 
             if not injected:
-                logger.info("MemPalace prefetch skipped: query='%s' (below adaptive threshold)", search_query[:80])
+                self._summary_skips += 1
+                self._emit_batched_summary()
                 return ""
 
             self._inject_count += 1
+            self._summary_injects += 1
 
             # 5. Sort by room priority (decisions > problems > architecture > general > technical)
             room_order = {r: i for i, r in enumerate(self._PRIORITY_ROOMS)}
@@ -251,7 +257,10 @@ class MemPalaceProvider(MemoryProvider):
             if len(prefetch_text) > self._max_prefetch_chars:
                 prefetch_text = prefetch_text[:self._max_prefetch_chars] + "\n\n... (budget limit)"
 
-            logger.info(
+            self._summary_chars += len(prefetch_text)
+            self._emit_batched_summary()
+
+            logger.debug(
                 "MemPalace prefetch: query='%s' top=%.3f results=%d chars=%d total_injects=%d",
                 search_query[:80],
                 results[0]["score"] if results else 0,
@@ -261,7 +270,7 @@ class MemPalaceProvider(MemoryProvider):
             )
             return prefetch_text
         except Exception as e:
-            logger.warning("MemPalace prefetch failed: %s", e)
+            logger.debug("MemPalace prefetch failed: %s", e)
             return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -667,6 +676,27 @@ class MemPalaceProvider(MemoryProvider):
                     r['_freshness'] = 'month'
             except (ValueError, TypeError):
                 pass
+
+    # ------------------------------------------------------------------
+    # Batched logging: summary every 10 turns instead of per-turn spam
+    # ------------------------------------------------------------------
+
+    def _emit_batched_summary(self) -> None:
+        """Emit a single INFO log every 10 prefetch calls with aggregate stats.
+
+        Per-turn activity stays at DEBUG. Only the summary hits INFO —
+        one line per ~10 turns instead of one per turn.
+        """
+        total = self._summary_skips + self._summary_injects
+        if total >= 10:
+            logger.info(
+                "MemPalace summary: %d turns (%d injected, %d skipped) — %d chars, %d total injects this session",
+                total, self._summary_injects, self._summary_skips,
+                self._summary_chars, self._inject_count,
+            )
+            self._summary_skips = 0
+            self._summary_injects = 0
+            self._summary_chars = 0
 
     # ------------------------------------------------------------------
     # Adaptive threshold: auto-tunes injection sensitivity
