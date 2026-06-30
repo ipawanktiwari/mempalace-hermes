@@ -35,10 +35,14 @@ These optimizations run automatically — no config needed:
 | | |
 |---|---|
 | **Keyword extraction** | Strips 200+ filler words from queries before searching. 50-70% shorter search strings = stronger semantic signal from fewer tokens. |
-| **Room priority** | `decisions` and `problems` rooms sort above noisy `technical` room. Higher-quality context delivered first. |
-| **Dynamic threshold** | Skips prefetch entirely when no strong match exists. Saves ~800 tokens per turn vs always injecting weak results. |
+| **Room-targeted search** | Searches high-signal rooms (`decisions`, `problems`, `architecture`, `general`) first — `technical` only as fallback. Better context, less noise. |
+| **Freshness boosting** | Recent sessions get score multipliers: ≤7 days ×1.15, ≤30 days ×1.08. ChromaDB has no recency concept — this compensates. |
+| **Adaptive threshold** | Auto-tunes injection sensitivity per session. Loosens when too many queries miss, tightens when too many hit. Self-optimizing. |
+| **Confidence metadata** | Every injection includes `high/medium/low` confidence, score stats, and room distribution. Agent knows what to trust at a glance. |
+| **Keyword snippets** | Extracts 1-2 most query-relevant sentences per result (keyword density heuristic). Instant context without reading full content. |
+| **Query expansion** | Enriches short follow-ups ("yes go ahead") with keywords from the last 3 messages. No more dead searches on filler queries. |
 
-**Real-world impact:** A 20-turn session with dynamic threshold burns ~5,000 tokens on memory vs ~20,000 without — **75% fewer tokens wasted on irrelevant context** while still injecting real recall when it matters (≥0.55 single match or ≥0.45 multi-match).
+**Real-world impact:** A 20-turn session burns ~5,000 tokens on memory vs ~20,000 with naive always-inject — **75% fewer tokens wasted** while the adaptive threshold ensures strong matches always surface and weak queries stay silent.
 
 ---
 
@@ -181,36 +185,43 @@ The agent also receives automatic context via `prefetch()` — before every turn
 
 Token burn matters — it's money. Here's what MemPalace for Hermes costs vs saves:
 
-| Scenario | Without MemPalace | With MemPalace (always inject) | With MemPalace + Threshold |
+### The 8-Step Prefetch Pipeline
+
+Every turn, before the agent responds:
+
+1. **Expand** — enriches short follow-ups with recent conversation keywords
+2. **Target search** — hits high-signal rooms first (`decisions` → `problems` → `architecture` → `general`), `technical` as last resort
+3. **Boost freshness** — recent sessions (≤7d: ×1.15, ≤30d: ×1.08) get priority
+4. **Adaptive threshold** — auto-loosens (0.50) or tightens (0.60) based on last 10 turns
+5. **Sort** — by room priority then score
+6. **Snippet** — extract 1-2 most relevant sentences per result
+7. **Format with meta** — confidence level, scores, room distribution in header
+8. **Budget** — cap at configurable char limit
+
+### Token Cost Comparison
+
+| Scenario | Without MemPalace | Naive always-inject | MemPalace + Smart Pipeline |
 |---|---|---|---|
-| **Weak query** (irrelevant match) | 0 tokens | ~1,000 tokens | **0 tokens** (skipped) |
-| **Moderate query** (partial match) | 0 tokens | ~800 tokens | **~450 tokens** (injected, useful) |
-| **Strong query** (clear match) | 0 tokens | ~700 tokens | **~700 tokens** (injected, high-value) |
+| **Weak query** (irrelevant match) | 0 tokens | ~1,000 tokens | **0 tokens** (skipped by threshold) |
+| **Moderate query** (partial match) | 0 tokens | ~800 tokens | **~450 tokens** (injected with snippets) |
+| **Strong query** (clear match) | 0 tokens | ~700 tokens | **~600 tokens** (high-quality, confidence-tagged) |
+| **Short follow-up** ("yes go ahead") | 0 tokens | ~800 tokens (dead search) | **~500 tokens** (context-expanded search) |
 | **20-turn session** (mixed queries) | 0 tokens | ~20,000 tokens | **~5,000 tokens** |
 
-**Bottom line:** Dynamic threshold alone saves ~15,000 tokens per session. Keyword extraction improves the quality of what *is* injected. Room priority ensures the most useful context is seen first. Combined: higher-quality recall at 75% lower token cost.
-
-### Tuning
-
-Adjust thresholds via `config.yaml` if your use case needs different sensitivity:
-
-```yaml
-memory:
-  mempalace:
-    min_score: 0.3        # Base score floor (default: 0.3)
-```
-
-The dynamic threshold logic (in code) can also be tuned:
+### Adaptive Threshold Logic
 
 ```python
-# Single strong match threshold
-if top >= 0.55 → inject
+# Base thresholds
+single ≥ 0.55 → inject       multi ≥ 0.45 + avg ≥ 0.40 → inject
 
-# Multiple moderate matches threshold
-if top >= 0.45 and len(results) >= 2 and avg >= 0.40 → inject
+# Auto-loosen: 7+ of last 10 queries skipped (surface more)
+single ≥ 0.50 → inject       multi ≥ 0.40 + avg ≥ 0.35 → inject
 
-# Otherwise → skip (not worth the tokens)
+# Auto-tighten: 9+ of last 10 queries injected (save tokens)
+single ≥ 0.60 → inject       multi ≥ 0.50 + avg ≥ 0.45 → inject
 ```
+
+**Bottom line:** Dynamic threshold alone saves ~15,000 tokens per session. Keyword extraction + room targeting improve recall quality. Freshness + query expansion + snippets make the injected context actually readable. Combined: higher-quality recall at 75% lower token cost, with zero config required.
 
 ---
 
@@ -275,7 +286,7 @@ if top >= 0.45 and len(results) >= 2 and avg >= 0.40 → inject
 ## Prerequisites
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) (any recent version)
-- [MemPalace](https://github.com/NousResearch/hermes-agent) installed and initialized
+- [MemPalace](https://github.com/ipawanktiwari/mempalace) installed and initialized
 - Python 3.10+ (already included with Hermes)
 
 ---
