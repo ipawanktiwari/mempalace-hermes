@@ -232,6 +232,7 @@ class MemPalaceProvider(MemoryProvider):
                 self._injection_history.pop(0)
 
             if not injected:
+                logger.info("MemPalace prefetch skipped: query='%s' (below adaptive threshold)", search_query[:80])
                 return ""
 
             self._inject_count += 1
@@ -250,7 +251,7 @@ class MemPalaceProvider(MemoryProvider):
             if len(prefetch_text) > self._max_prefetch_chars:
                 prefetch_text = prefetch_text[:self._max_prefetch_chars] + "\n\n... (budget limit)"
 
-            logger.debug(
+            logger.info(
                 "MemPalace prefetch: query='%s' top=%.3f results=%d chars=%d total_injects=%d",
                 search_query[:80],
                 results[0]["score"] if results else 0,
@@ -260,7 +261,7 @@ class MemPalaceProvider(MemoryProvider):
             )
             return prefetch_text
         except Exception as e:
-            logger.debug("MemPalace prefetch failed: %s", e)
+            logger.warning("MemPalace prefetch failed: %s", e)
             return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
