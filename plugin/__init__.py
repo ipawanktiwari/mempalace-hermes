@@ -19,6 +19,8 @@ Config in ``config.yaml`` under ``memory.mempalace`` (all optional)::
       results: 5
       min_score: 0.3
       timeout: 30
+      deduplicate: true    # collapse duplicate session sources
+      max_prefetch_chars: 4000  # max chars injected per turn
 
 Environment variable:
   ``MEMALACE_BINARY`` — path to mempalace executable (overrides config + PATH)
@@ -155,6 +157,8 @@ class MemPalaceProvider(MemoryProvider):
         self._default_results = int(self._config.get("results", 5))
         self._min_score = float(self._config.get("min_score", 0.3))
         self._timeout = int(self._config.get("timeout", 30))
+        self._deduplicate = self._config.get("deduplicate", True) not in (False, "false", "False")
+        self._max_prefetch_chars = int(self._config.get("max_prefetch_chars", 4000))
         self._session_id: str = ""
 
     # -- MemoryProvider ABC ------------------------------------------------
@@ -198,9 +202,14 @@ class MemPalaceProvider(MemoryProvider):
             return ""
         try:
             results = self._search(query, limit=self._default_results)
+            results = self._process_results(results)
             if not results:
                 return ""
-            return self._format_prefetch(results)
+            prefetch_text = self._format_prefetch(results)
+            # Respect char budget
+            if len(prefetch_text) > self._max_prefetch_chars:
+                prefetch_text = prefetch_text[:self._max_prefetch_chars] + "\n\n... (budget limit)"
+            return prefetch_text
         except Exception as e:
             logger.debug("MemPalace prefetch failed: %s", e)
             return ""
@@ -281,6 +290,17 @@ class MemPalaceProvider(MemoryProvider):
                 "description": "Search timeout in seconds",
                 "default": "30",
             },
+            {
+                "key": "deduplicate",
+                "description": "Collapse duplicate session sources, keeping highest score",
+                "default": "true",
+                "choices": ["true", "false"],
+            },
+            {
+                "key": "max_prefetch_chars",
+                "description": "Max chars injected per turn via prefetch",
+                "default": "4000",
+            },
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -296,14 +316,134 @@ class MemPalaceProvider(MemoryProvider):
             existing["memory"]["mempalace"] = values
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(existing, f, default_flow_style=False)
-            # Re-resolve binary in case user changed the path
+            # Re-resolve all config values
             self._config = values
             self._binary = _discover_binary(values.get("binary", ""))
             self._default_results = int(values.get("results", 5))
             self._min_score = float(values.get("min_score", 0.3))
             self._timeout = int(values.get("timeout", 30))
+            self._deduplicate = values.get("deduplicate", True) not in (False, "false", "False")
+            self._max_prefetch_chars = int(values.get("max_prefetch_chars", 4000))
         except Exception as e:
             logger.warning("Failed to save mempalace config: %s", e)
+
+    # ------------------------------------------------------------------
+    # Content cleaning — strip JSON/tool-call noise from exchange-mode results
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _clean_content(cls, content: str) -> str:
+        """Strip JSON tool-call noise from exchange-mode content.
+
+        Exchange mode preserves raw JSON tool invocations alongside
+        narrative text. We keep only lines that look like human content
+        and discard JSON blobs, escaped strings, and structural markers.
+        """
+        if not content:
+            return ""
+
+        import re
+        lines = content.splitlines()
+        kept: list[str] = []
+
+        # Patterns that indicate a line is structural noise
+        _noise_line = re.compile(
+            r'^\s*'
+            r'(?:\{\s*"?|\}\s*"?|"\s*[a-z_]+\s*"?:\s*|'
+            r'\[?\s*\{\s*"?|"\s*\]|'  # JSON brackets
+            r'\\\s*"|\\\\|[{}[\]",]{8,}|'  # heavy escaping / raw JSON
+            r'\"[a-z_]+\"\s*:\s*[\[{]|'  # key-value start
+            r'\s*"[a-z_]+\":|'  # JSON key
+            r'\s*\}{1,3}\s*$)'
+        )
+
+        # Lines that are entirely non-human (pure symbols, braces, quotes)
+        _json_only = re.compile(r'^[\s"{}[\]\\,:]+$')
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Skip empty
+            if not stripped:
+                continue
+
+            # Skip pure punctuation/JSON lines
+            if _json_only.match(stripped):
+                continue
+
+            # Skip structural noise
+            if _noise_line.match(stripped):
+                continue
+
+            # Skip lines that are mostly raw JSON (high ratio of json chars)
+            json_chars = sum(1 for c in stripped if c in '{}[]":\\')
+            if len(stripped) > 5 and json_chars / len(stripped) > 0.35:
+                continue
+
+            kept.append(line)
+
+        result = "\n".join(kept).strip()
+
+        # Collapse 3+ blank lines
+        result = re.sub(r'\n{3,}', '\n\n', result)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Result processing (dedup, clean, budget)
+    # ------------------------------------------------------------------
+
+    def _process_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Clean content, deduplicate by session, and filter noise."""
+        if not results:
+            return []
+
+        # Clean each result's content
+        for r in results:
+            r["content"] = self._clean_content(r.get("content", ""))
+            # Drop results that became empty after cleaning
+        results = [r for r in results if r.get("content", "").strip()]
+
+        # Deduplicate by session source (keep highest score)
+        if self._deduplicate:
+            seen: Dict[str, Dict[str, Any]] = {}
+            for r in results:
+                source = r.get("source", "")
+                # Normalize: strip date suffixes from session filenames
+                base = source.rsplit("_", 3)[0] if "_" in source else source
+                if base not in seen or r.get("score", 0) > seen[base].get("score", 0):
+                    seen[base] = r
+            results = sorted(seen.values(), key=lambda r: r.get("score", 0), reverse=True)
+
+        return results
+
+    @staticmethod
+    def _format_prefetch(results: List[Dict[str, Any]]) -> str:
+        if not results:
+            return ""
+
+        lines = ["## MemPalace Recall"]
+        for r in results:
+            score = r.get("score", 0)
+            source = r.get("source", "unknown")
+            room = r.get("room", "")
+            wing = r.get("wing", "")
+            content = r.get("content", "")
+
+            scope = f"{wing}/{room}" if wing and room else wing or room or ""
+            header = f"[{score:.2f}] {scope}" if scope else f"[{score:.2f}]"
+            if source:
+                header += f" ({source})"
+
+            lines.append(f"\n### {header}")
+
+            max_len = 2000
+            trimmed = content[:max_len] if len(content) > max_len else content
+            if len(content) > max_len:
+                trimmed += "\n... (truncated)"
+            lines.append(trimmed)
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Internal helpers
