@@ -40,6 +40,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -213,19 +214,21 @@ class MemPalaceProvider(MemoryProvider):
             # 1. Extract keywords for better semantic search signal
             search_query = self._extract_keywords(query)
 
-            # 2. Search with keyword-optimized query
-            results = self._search(search_query, wing=self._wing, limit=self._default_results)
-            results = self._process_results(results)
+            # 2. Room-targeted search: high-signal rooms first, fall back to technical
+            results = self._targeted_search(search_query)
 
-            # 3. Dynamic threshold — skip injection if matches are weak
+            # 3. Freshness boosting — recent sessions get score multiplier
+            self._boost_freshness(results)
+
+            # 4. Dynamic threshold — skip injection if matches are weak
             if not self._should_inject(results):
                 return ""
 
-            # 4. Sort by room priority (decisions > problems > architecture > general > technical)
+            # 5. Sort by room priority (decisions > problems > architecture > general > technical)
             room_order = {r: i for i, r in enumerate(self._PRIORITY_ROOMS)}
             results.sort(key=lambda r: (room_order.get(r.get("room", ""), 99), -(r.get("score", 0))))
 
-            # 5. Format with char budget
+            # 6. Format with char budget
             prefetch_text = self._format_prefetch(results)
             if len(prefetch_text) > self._max_prefetch_chars:
                 prefetch_text = prefetch_text[:self._max_prefetch_chars] + "\n\n... (budget limit)"
@@ -517,6 +520,83 @@ class MemPalaceProvider(MemoryProvider):
     # Rooms ordered by signal quality. Technical room (exchange mode)
     # is noisy raw JSON; decisions/problems are structured extracts.
     _PRIORITY_ROOMS = ['decisions', 'problems', 'architecture', 'general', 'technical']
+
+    # ------------------------------------------------------------------
+    # Room-targeted search: high-signal rooms first
+    # ------------------------------------------------------------------
+
+    def _targeted_search(self, query: str) -> List[Dict[str, Any]]:
+        """Search high-signal rooms first, fall back to technical only if needed.
+
+        Strategy: get 2 results from decisions + 2 from problems first.
+        If we have enough quality hits, skip noisy technical room entirely.
+        Otherwise fill remaining slots from technical.
+
+        Returns processed + deduplicated results, capped at ``_default_results``.
+        """
+        high_signal = ['decisions', 'problems', 'architecture', 'general']
+        all_results: List[Dict[str, Any]] = []
+        seen_sources: set = set()
+
+        # Phase 1: search high-signal rooms (2 results each)
+        for room in high_signal:
+            if len(all_results) >= self._default_results:
+                break
+            room_results = self._search(query, wing=self._wing, room=room, limit=2)
+            room_results = self._process_results(room_results)
+            for r in room_results:
+                src = r.get('source', '')
+                if src not in seen_sources:
+                    seen_sources.add(src)
+                    all_results.append(r)
+
+        # Phase 2: fill remaining slots from broad search (may include technical)
+        if len(all_results) < self._default_results:
+            remaining = self._default_results - len(all_results)
+            broad = self._search(query, wing=self._wing, limit=self._default_results + 3)
+            broad = self._process_results(broad)
+            for r in broad:
+                src = r.get('source', '')
+                if src not in seen_sources:
+                    seen_sources.add(src)
+                    all_results.append(r)
+                if len(all_results) >= self._default_results:
+                    break
+
+        return all_results[:self._default_results]
+
+    # ------------------------------------------------------------------
+    # Freshness boosting: recent sessions get score multiplier
+    # ------------------------------------------------------------------
+
+    # Session filenames embed dates: session_20260428_... or session_cron_...
+    _SESSION_DATE_RE = re.compile(r'session(?:_cron)?_(\d{8})_')
+
+    @classmethod
+    def _boost_freshness(cls, results: List[Dict[str, Any]]) -> None:
+        """Apply recency multiplier to scores in-place.
+
+        Sessions from the last 7 days get ×1.15, last 30 days get ×1.08.
+        ChromaDB has no concept of time — this compensates.
+        """
+        now = datetime.now(timezone.utc)
+        for r in results:
+            source = r.get('source', '')
+            m = cls._SESSION_DATE_RE.search(source)
+            if not m:
+                continue
+            try:
+                dt = datetime.strptime(m.group(1), '%Y%m%d').replace(tzinfo=timezone.utc)
+                age_days = (now - dt).days
+                score = r.get('score', 0)
+                if age_days <= 7:
+                    r['score'] = round(score * 1.15, 4)
+                    r['_freshness'] = 'week'
+                elif age_days <= 30:
+                    r['score'] = round(score * 1.08, 4)
+                    r['_freshness'] = 'month'
+            except (ValueError, TypeError):
+                pass
 
     # ------------------------------------------------------------------
     # Dynamic threshold: skip injection for weak matches
