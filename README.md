@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes](https://img.shields.io/badge/Hermes-Agent-6C5CE7)](https://github.com/NousResearch/hermes-agent)
+[![Release](https://img.shields.io/badge/release-v1.0.0-green)](https://github.com/ipawanktiwari/mempalace-hermes/releases/tag/v1.0.0)
 
 **Semantic long-term memory for [Hermes Agent](https://github.com/NousResearch/hermes-agent) powered by MemPalace (ChromaDB vector search).**
 
@@ -310,9 +311,31 @@ Set `MEMALACE_BINARY=/path/to/mempalace` in your environment, or configure `memo
 
 ---
 
+## Development
+
+### Branching
+
+```
+main     ← tagged releases (v1.0.0, v1.1.0, ...)
+  └── develop  ← active feature/fix work, merged into main for releases
+```
+
+**Workflow:**
+1. All new features and fixes go to `develop`
+2. When ready for release: `git checkout main && git merge develop && git tag vX.Y.Z && git push --tags origin main`
+3. Continue on `develop` for next cycle
+
+### Release History
+
+| Version | Date | Highlights |
+|---|---|---|
+| **v1.0.0** | 2026-06-30 | Initial release — 10 features, 8-step prefetch pipeline, 75% token savings |
+
+---
+
 ## Contributing
 
-Issues and PRs welcome. The plugin follows the [Hermes Memory Provider plugin convention](https://github.com/NousResearch/hermes-agent) — any `MemoryProvider` implementation in `$HERMES_HOME/plugins/<name>/` is auto-discovered.
+Issues and PRs welcome. Target `develop` for all changes. The plugin follows the [Hermes Memory Provider plugin convention](https://github.com/NousResearch/hermes-agent) — any `MemoryProvider` implementation in `$HERMES_HOME/plugins/<name>/` is auto-discovered.
 
 ---
 
