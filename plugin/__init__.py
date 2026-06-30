@@ -24,6 +24,12 @@ Config in ``config.yaml`` under ``memory.mempalace`` (all optional)::
 
 Environment variable:
   ``MEMALACE_BINARY`` — path to mempalace executable (overrides config + PATH)
+
+Tuning for token efficiency:
+  The provider extracts keywords from verbose queries before searching,
+  prioritises high-signal rooms (decisions, problems), and skips injection
+  entirely when no strong matches exist — saving ~600-1000 tokens per
+  turn vs. injecting low-quality context.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -130,7 +137,7 @@ def _discover_binary(config_binary: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    """Read provider config from ``config.yaml`` → ``memory.mempalace``."""
+    """Read provider config from ``config.yaml`` -> ``memory.mempalace``."""
     try:
         from hermes_cli.config import load_config
         config = load_config()
@@ -201,15 +208,35 @@ class MemPalaceProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not query or not query.strip() or not self._binary:
             return ""
+
         try:
-            results = self._search(query, wing=self._wing, limit=self._default_results)
+            # 1. Extract keywords for better semantic search signal
+            search_query = self._extract_keywords(query)
+
+            # 2. Search with keyword-optimized query
+            results = self._search(search_query, wing=self._wing, limit=self._default_results)
             results = self._process_results(results)
-            if not results:
+
+            # 3. Dynamic threshold — skip injection if matches are weak
+            if not self._should_inject(results):
                 return ""
+
+            # 4. Sort by room priority (decisions > problems > architecture > general > technical)
+            room_order = {r: i for i, r in enumerate(self._PRIORITY_ROOMS)}
+            results.sort(key=lambda r: (room_order.get(r.get("room", ""), 99), -(r.get("score", 0))))
+
+            # 5. Format with char budget
             prefetch_text = self._format_prefetch(results)
-            # Respect char budget
             if len(prefetch_text) > self._max_prefetch_chars:
                 prefetch_text = prefetch_text[:self._max_prefetch_chars] + "\n\n... (budget limit)"
+
+            logger.debug(
+                "MemPalace prefetch: query='%s' top_score=%.3f results=%d chars=%d",
+                search_query[:80],
+                results[0]["score"] if results else 0,
+                len(results),
+                len(prefetch_text),
+            )
             return prefetch_text
         except Exception as e:
             logger.debug("MemPalace prefetch failed: %s", e)
@@ -424,36 +451,107 @@ class MemPalaceProvider(MemoryProvider):
 
         return results
 
-    @staticmethod
-    def _format_prefetch(results: List[Dict[str, Any]]) -> str:
-        if not results:
-            return ""
+    # ------------------------------------------------------------------
+    # Query refinement: keyword extraction for better semantic search
+    # ------------------------------------------------------------------
 
-        lines = ["## MemPalace Recall"]
-        for r in results:
-            score = r.get("score", 0)
-            source = r.get("source", "unknown")
-            room = r.get("room", "")
-            wing = r.get("wing", "")
-            content = r.get("content", "")
+    # Words to strip from queries — these dilute semantic signal
+    _FILLER_WORDS = frozenset({
+        'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been',
+        'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him',
+        'her', 'us', 'them', 'my', 'your', 'his', 'its', 'our',
+        'their', 'this', 'that', 'these', 'those', 'what', 'which',
+        'who', 'whom', 'how', 'when', 'where', 'why', 'do', 'does',
+        'did', 'can', 'could', 'will', 'would', 'shall', 'should',
+        'may', 'might', 'must', 'have', 'has', 'had', 'not', 'no',
+        'nor', 'so', 'if', 'then', 'else', 'than', 'too', 'very',
+        'just', 'about', 'also', 'only', 'even', 'still', 'already',
+        'really', 'actually', 'basically', 'please', 'thanks',
+        'go', 'ahead', 'let', 'know', 'want', 'need', 'get', 'make',
+        'right', 'sure', 'think', 'say', 'tell', 'use', 'help',
+        'check', 'see', 'ok', 'okay', 'yes', 'yeah', 'well', 'like',
+        'and', 'but', 'or', 'for', 'with', 'from', 'into', 'onto',
+        'to', 'on', 'in', 'at', 'by', 'of', 'up', 'down', 'out',
+        'because', 'without', 'something', 'anything', 'nothing',
+        'any', 'some', 'each', 'every', 'all', 'both', 'few', 'more',
+        'most', 'other', 'such', 'people', 'person', 'thing', 'things',
+        'way', 'ways', 'kind', 'kinds', 'much', 'many', 'one', 'two',
+        'remember', 'discussed', 'discuss', 'discussion', 'earlier',
+        'before', 'after', 'now', 'later', 'often', 'always', 'never',
+    })
 
-            scope = f"{wing}/{room}" if wing and room else wing or room or ""
-            header = f"[{score:.2f}] {scope}" if scope else f"[{score:.2f}]"
-            if source:
-                header += f" ({source})"
+    @classmethod
+    def _extract_keywords(cls, query: str, max_words: int = 12) -> str:
+        """Extract signal-bearing keywords from a verbose query.
 
-            lines.append(f"\n### {header}")
+        Strips fillers, question words, and conversational fluff.
+        Returns a space-separated string of up to ``max_words``
+        content-bearing terms — much better semantic search input
+        than a raw 200-char chat message.
+        """
+        if not query or len(query) < 20:
+            return query
 
-            max_len = 2000
-            trimmed = content[:max_len] if len(content) > max_len else content
-            if len(content) > max_len:
-                trimmed += "\n... (truncated)"
-            lines.append(trimmed)
+        # Tokenize: lowercase, strip punctuation
+        tokens = re.findall(r'[a-zA-Z0-9_-]+', query.lower())
+        kept = [t for t in tokens if t not in cls._FILLER_WORDS and len(t) > 1]
 
-        return "\n".join(lines)
+        # If stripping gutted the query, return original
+        if len(kept) < 2:
+            return query
+
+        # Deduplicate while preserving order
+        seen: set = set()
+        unique = []
+        for t in kept:
+            if t not in seen:
+                seen.add(t)
+                unique.append(t)
+
+        return ' '.join(unique[:max_words])
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Room priority: high-signal rooms first
+    # ------------------------------------------------------------------
+
+    # Rooms ordered by signal quality. Technical room (exchange mode)
+    # is noisy raw JSON; decisions/problems are structured extracts.
+    _PRIORITY_ROOMS = ['decisions', 'problems', 'architecture', 'general', 'technical']
+
+    # ------------------------------------------------------------------
+    # Dynamic threshold: skip injection for weak matches
+    # ------------------------------------------------------------------
+
+    def _should_inject(self, results: List[Dict[str, Any]]) -> bool:
+        """Decide whether prefetch results are strong enough to inject.
+
+        Returns True only when results are likely to be actually useful.
+        Saves 4000 chars (~1000 tokens) per turn when nothing matches.
+        """
+        if not results:
+            return False
+
+        scores = [r.get('score', 0) for r in results]
+        top = scores[0]
+        avg = sum(scores) / len(scores) if scores else 0
+
+        # Strong single match
+        if top >= 0.55:
+            return True
+
+        # Multiple moderate matches
+        if top >= 0.45 and len(results) >= 2 and avg >= 0.40:
+            return True
+
+        # Otherwise: skip — not worth the token burn
+        logger.debug(
+            "MemPalace prefetch skipped: top_score=%.3f avg=%.3f results=%d",
+            top, avg, len(results),
+        )
+        return False
+
+    # ------------------------------------------------------------------
+    # Core provider methods
     # ------------------------------------------------------------------
 
     def _search(
