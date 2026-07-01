@@ -329,6 +329,7 @@ main     ← tagged releases (v1.0.0, v1.1.0, ...)
 
 | Version | Date | Highlights |
 |---|---|---|
+| **v1.0.3** | 2026-07-01 | CI pipeline, 64 tests, CHANGELOG, CONTRIBUTING, is_available() cache, install.sh fix |
 | **v1.0.2** | 2026-07-01 | plugin.yaml version fix, housekeeping |
 | **v1.0.1** | 2026-07-01 | Batched logging, log level fixes, README badges |
 | **v1.0.0** | 2026-06-30 | Initial release — 10 features, 8-step prefetch pipeline, 75% token savings |
