@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Hermes](https://img.shields.io/badge/Hermes-Agent-6C5CE7)](https://github.com/NousResearch/hermes-agent)
-[![Release](https://img.shields.io/badge/release-v1.0.0-green)](https://github.com/ipawanktiwari/mempalace-hermes/releases/tag/v1.0.0)
+[![Release](https://img.shields.io/github/v/release/ipawanktiwari/mempalace-hermes)](https://github.com/ipawanktiwari/mempalace-hermes/releases)
 
 **Semantic long-term memory for [Hermes Agent](https://github.com/NousResearch/hermes-agent) powered by MemPalace (ChromaDB vector search).**
 
@@ -329,6 +329,8 @@ main     ← tagged releases (v1.0.0, v1.1.0, ...)
 
 | Version | Date | Highlights |
 |---|---|---|
+| **v1.0.2** | 2026-07-01 | plugin.yaml version fix, housekeeping |
+| **v1.0.1** | 2026-07-01 | Batched logging, log level fixes, README badges |
 | **v1.0.0** | 2026-06-30 | Initial release — 10 features, 8-step prefetch pipeline, 75% token savings |
 
 ---
