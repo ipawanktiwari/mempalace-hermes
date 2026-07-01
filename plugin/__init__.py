@@ -169,6 +169,8 @@ class MemPalaceProvider(MemoryProvider):
         self._max_prefetch_chars = int(self._config.get("max_prefetch_chars", 4000))
         self._wing = self._config.get("wing", "sessions")
         self._session_id: str = ""
+        # Cache binary availability — checked once, cached for the session
+        self._available: bool | None = None
         # Adaptive threshold state — tracks last 10 injection decisions
         self._injection_history: List[bool] = []  # True=injected, False=skipped
         self._inject_count: int = 0  # total injections this session
@@ -186,8 +188,11 @@ class MemPalaceProvider(MemoryProvider):
         return "mempalace"
 
     def is_available(self) -> bool:
+        if self._available is not None:
+            return self._available
         if not self._binary:
             logger.debug("MemPalace binary not found")
+            self._available = False
             return False
         try:
             result = subprocess.run(
@@ -195,9 +200,11 @@ class MemPalaceProvider(MemoryProvider):
                 capture_output=True,
                 timeout=10,
             )
-            return result.returncode == 0
+            self._available = result.returncode == 0
+            return self._available
         except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError) as e:
             logger.debug("MemPalace availability check failed: %s", e)
+            self._available = False
             return False
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -328,7 +335,7 @@ class MemPalaceProvider(MemoryProvider):
             return tool_error(f"MemPalace search failed: {e}")
 
     def shutdown(self) -> None:
-        pass
+        self._available = None
 
     # -- Config schema for hermes memory setup wizard ----------------------
 

@@ -286,7 +286,7 @@ single ≥ 0.60 → inject       multi ≥ 0.50 + avg ≥ 0.45 → inject
 
 ## Prerequisites
 
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) (any recent version)
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) (v0.3.0+)
 - [MemPalace](https://github.com/ipawanktiwari/mempalace) installed and initialized
 - Python 3.10+ (already included with Hermes)
 

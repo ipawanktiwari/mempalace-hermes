@@ -1,6 +1,7 @@
 name: mempalace
 version: 1.0.0
 description: "MemPalace memory — semantic search over past conversation sessions via ChromaDB. Zero-config local recall without external services."
+hermes_min_version: "0.3.0"
 pip_dependencies: []
 external_dependencies:
   - name: mempalace
