@@ -180,6 +180,9 @@ class MemPalaceProvider(MemoryProvider):
         self._summary_skips: int = 0
         self._summary_injects: int = 0
         self._summary_chars: int = 0
+        # State file for cross-session persistence
+        self._state_dir: Path = Path.home() / ".hermes" / "mempalace"
+        self._state_file: Path = self._state_dir / "provider_state.json"
 
     # -- MemoryProvider ABC ------------------------------------------------
 
@@ -209,6 +212,7 @@ class MemPalaceProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
+        self._load_state()  # restore cross-session threshold state
         logger.info("MemPalace provider initialized, binary=%s, session=%s",
                      self._binary, session_id)
 
@@ -335,6 +339,7 @@ class MemPalaceProvider(MemoryProvider):
             return tool_error(f"MemPalace search failed: {e}")
 
     def shutdown(self) -> None:
+        self._save_state()  # persist threshold state for next session
         self._available = None
 
     # -- Config schema for hermes memory setup wizard ----------------------
@@ -472,15 +477,17 @@ class MemPalaceProvider(MemoryProvider):
     # ------------------------------------------------------------------
 
     def _process_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Clean content, deduplicate by session, and filter noise."""
+        """Clean content, deduplicate by session, filter low-signal noise."""
         if not results:
             return []
 
         # Clean each result's content
         for r in results:
             r["content"] = self._clean_content(r.get("content", ""))
-            # Drop results that became empty after cleaning
         results = [r for r in results if r.get("content", "").strip()]
+
+        # Quality filter: drop results below minimum signal threshold
+        results = [r for r in results if self._content_quality_score(r.get("content", "")) >= 0.15]
 
         # Deduplicate by session source (keep highest score)
         if self._deduplicate:
@@ -494,6 +501,100 @@ class MemPalaceProvider(MemoryProvider):
             results = sorted(seen.values(), key=lambda r: r.get("score", 0), reverse=True)
 
         return results
+
+    # ------------------------------------------------------------------
+    # Content quality scoring: filter low-signal results before injection
+    # ------------------------------------------------------------------
+
+    # Patterns that indicate low-human-signal content
+    _LOW_SIGNAL_PATTERNS = [
+        re.compile(r, re.IGNORECASE) for r in [
+            r'traceback\s*\(most recent call',  # Python traceback header
+            r'^\s*File\s+["\']',                 # Python stack frame (single/double quotes)
+            r'^\s+\.\.\.\s+\d+\s+more',          # Java omitted frames
+            r'^\s*at\s+\w+\.\w+\([\w.]+:\d+\)',  # Java stack trace
+            r'^\s*raise\s+\w+',                  # Python raise statement
+            r'^\s*\w+Error[:(]',                 # Error classes: ValueError: ..., KeyError(...
+            r'exit\s*code:\s*\d+',               # process exit codes
+            r'ERROR:?\s',                        # error markers (capped ratio)
+            r'^\s*\{.*\}\s*$',                   # pure JSON line
+            r'^std(out|err):',                   # terminal output markers
+            r'Executed\s+\d+\s+tasks?',          # batch job summary
+            r'successfully\s+completed',         # success markers
+            r'^\s*\d+\s+(items?|files?|results?)',  # count-only lines
+        ]
+    ]
+
+    @classmethod
+    def _content_quality_score(cls, content: str) -> float:
+        r"""Score content by human-signal density (0.0 – 1.0).
+
+        Heuristic that penalizes:
+        - Stack traces, error dumps, tool output
+        - High ratio of JSON/symbol chars
+        - Lines that are single-word or pure numbers
+        - Content dominated by boilerplate markers
+
+        Rewards:
+        - Longer sentences (12+ chars)
+        - Mixed case, natural punctuation
+        - Keyword-level diversity
+
+        Returns 0.0 for empty content, ~0.8+ for human narrative,
+        ~0.05-0.20 for tool-output dumps.
+        """
+        if not content or not content.strip():
+            return 0.0
+
+        lines = content.splitlines()
+        total_lines = len(lines)
+        if total_lines == 0:
+            return 0.0
+
+        signal_lines = 0
+        noise_lines = 0
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # Skip lines matching low-signal patterns
+            is_noise = False
+            for pat in cls._LOW_SIGNAL_PATTERNS:
+                if pat.search(stripped):
+                    is_noise = True
+                    break
+            if is_noise:
+                noise_lines += 1
+                continue
+
+            # Score individual line quality
+            words = len(stripped.split())
+            has_mixed_case = stripped != stripped.lower() and stripped != stripped.upper()
+            has_punct = any(c in stripped for c in '.!?,;:')
+            json_ratio = sum(1 for c in stripped if c in '{}[]":\\') / max(len(stripped), 1)
+
+            # Good signal: medium-length line with mixed case and punctuation
+            if words >= 5 and has_mixed_case and json_ratio < 0.15:
+                signal_lines += 1
+            elif words >= 8 and json_ratio < 0.1:
+                signal_lines += 1
+            elif json_ratio > 0.3:
+                noise_lines += 1
+            # Short mixed-case lines with punctuation are weak but not noise
+            elif words >= 3 and has_mixed_case and json_ratio < 0.1:
+                signal_lines += 0.5  # type: ignore[operator]
+
+        scored_lines = signal_lines + noise_lines
+        if scored_lines == 0:
+            # Edge case: content is very short but not pure noise.
+            # Give it a pass at low confidence rather than dropping it entirely.
+            if total_lines <= 3 and len(content) < 100:
+                return 0.2
+            return 0.0
+
+        return round(signal_lines / scored_lines, 3)
 
     # ------------------------------------------------------------------
     # Query refinement: keyword extraction for better semantic search
@@ -612,42 +713,25 @@ class MemPalaceProvider(MemoryProvider):
     # ------------------------------------------------------------------
 
     def _targeted_search(self, query: str) -> List[Dict[str, Any]]:
-        """Search high-signal rooms first, fall back to technical only if needed.
+        """Single broad search with client-side room-priority sorting.
 
-        Strategy: get 2 results from decisions + 2 from problems first.
-        If we have enough quality hits, skip noisy technical room entirely.
-        Otherwise fill remaining slots from technical.
+        Previously made 4-5 subprocess calls per turn (one per room + fallback).
+        Now: one broad search → deduplicate → sort by room priority → return top N.
 
         Returns processed + deduplicated results, capped at ``_default_results``.
         """
-        high_signal = ['decisions', 'problems', 'architecture', 'general']
-        all_results: List[Dict[str, Any]] = []
-        seen_sources: set = set()
+        # Single broad search — fetch 3x to have buffer for dedup + filtering
+        broad = self._search(query, wing=self._wing, limit=self._default_results * 3)
+        all_results = self._process_results(broad)
 
-        # Phase 1: search high-signal rooms (2 results each)
-        for room in high_signal:
-            if len(all_results) >= self._default_results:
-                break
-            room_results = self._search(query, wing=self._wing, room=room, limit=2)
-            room_results = self._process_results(room_results)
-            for r in room_results:
-                src = r.get('source', '')
-                if src not in seen_sources:
-                    seen_sources.add(src)
-                    all_results.append(r)
-
-        # Phase 2: fill remaining slots from broad search (may include technical)
-        if len(all_results) < self._default_results:
-            remaining = self._default_results - len(all_results)
-            broad = self._search(query, wing=self._wing, limit=self._default_results + 3)
-            broad = self._process_results(broad)
-            for r in broad:
-                src = r.get('source', '')
-                if src not in seen_sources:
-                    seen_sources.add(src)
-                    all_results.append(r)
-                if len(all_results) >= self._default_results:
-                    break
+        # Sort by room priority then score (descending)
+        room_order = {r: i for i, r in enumerate(self._PRIORITY_ROOMS)}
+        all_results.sort(
+            key=lambda r: (
+                room_order.get(r.get('room', ''), 99),
+                -(r.get('score', 0)),
+            )
+        )
 
         return all_results[:self._default_results]
 
@@ -704,6 +788,54 @@ class MemPalaceProvider(MemoryProvider):
             self._summary_skips = 0
             self._summary_injects = 0
             self._summary_chars = 0
+
+    # ------------------------------------------------------------------
+    # Cross-session state persistence: save/load adaptive threshold
+    # ------------------------------------------------------------------
+
+    def _save_state(self) -> None:
+        """Persist adaptive threshold state to disk for next session.
+
+        Without this, every new Hermes session starts with a blank
+        injection history and the threshold takes ~10 turns to calibrate.
+        Saving the last 10 decisions means the next session starts
+        already calibrated.
+        """
+        if not self._injection_history:
+            return
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            state = {
+                "injection_history": self._injection_history,
+                "inject_count": self._inject_count,
+                "last_session": self._session_id,
+            }
+            with open(self._state_file, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            logger.debug("MemPalace state saved to %s", self._state_file)
+        except (OSError, TypeError) as e:
+            logger.debug("MemPalace state save failed: %s", e)
+
+    def _load_state(self) -> None:
+        """Restore adaptive threshold state from a previous session."""
+        try:
+            if not self._state_file.exists():
+                return
+            with open(self._state_file, encoding="utf-8") as f:
+                state = json.load(f)
+            saved_history = state.get("injection_history", [])
+            if isinstance(saved_history, list) and len(saved_history) <= 10:
+                self._injection_history = [bool(v) for v in saved_history]
+                self._inject_count = int(state.get("inject_count", 0))
+                logger.debug(
+                    "MemPalace state loaded: %d history entries, %d total injects",
+                    len(self._injection_history),
+                    self._inject_count,
+                )
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.debug("MemPalace state load failed: %s", e)
+            self._injection_history = []
+            self._inject_count = 0
 
     # ------------------------------------------------------------------
     # Adaptive threshold: auto-tunes injection sensitivity
