@@ -45,7 +45,7 @@ These optimizations run automatically — no config needed:
 | **Content quality filter** | Scores results by human-signal density — drops stack traces, JSON dumps, and terminal output before injection. Less noise, fewer wasted tokens. |
 | **Cross-session state** | Persists adaptive threshold history to disk. New sessions start already calibrated instead of blind for the first 10 turns. |
 
-**Real-world impact:** A 20-turn session burns ~5,000 tokens on memory vs ~20,000 with naive always-inject — **75% fewer tokens wasted** while the adaptive threshold ensures strong matches always surface and weak queries stay silent.
+**Real-world impact:** A single mempalace search retrieves context in ~2,600 chars (~650 tokens) vs ~19,000 chars (~4,750 tokens) the agent would burn reading session files and re-searching — **~86% fewer tokens per search**. Over a 20-turn session with prefetch, that's ~6,000-10,000 tokens saved. The adaptive threshold and quality filter ensure weak matches get skipped entirely, not injected as noise.
 
 ---
 
