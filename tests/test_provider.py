@@ -856,3 +856,181 @@ def test_extract_keywords_none():
     from __init__ import MemPalaceProvider
 
     assert MemPalaceProvider._extract_keywords(None) is None
+
+
+# ======================================================================
+# v1.1.0: _content_quality_score  (classmethod)
+# ======================================================================
+
+
+class TestContentQualityScore:
+    """Tests for MemPalaceProvider._content_quality_score classmethod."""
+
+    def test_high_quality_human_text_scores_high(self):
+        from __init__ import MemPalaceProvider
+
+        content = (
+            "We decided to use FastAPI for the new microservice. "
+            "The deployment pipeline will use GitHub Actions with "
+            "staging promotion before production. PostgreSQL for the database."
+        )
+        score = MemPalaceProvider._content_quality_score(content)
+        assert score >= 0.5, f"Expected >= 0.5, got {score}"
+
+    def test_stack_trace_scores_low(self):
+        from __init__ import MemPalaceProvider
+
+        content = (
+            "Traceback (most recent call last):\n"
+            "  File 'app.py', line 42, in handle_request\n"
+            "    result = process(data)\n"
+            "  File 'core.py', line 15, in process\n"
+            "    raise ValueError('bad input')\n"
+            "ValueError: bad input\n"
+        )
+        score = MemPalaceProvider._content_quality_score(content)
+        assert score < 0.2, f"Expected < 0.2, got {score}"
+
+    def test_pure_json_scores_low(self):
+        from __init__ import MemPalaceProvider
+
+        content = (
+            '{"name": "deploy", "args": {"env": "prod"}}\n'
+            '{"status": "ok", "code": 200}\n'
+            '{"count": 5, "items": [1,2,3,4,5]}\n'
+        )
+        score = MemPalaceProvider._content_quality_score(content)
+        assert score < 0.2, f"Expected < 0.2, got {score}"
+
+    def test_empty_content_returns_zero(self):
+        from __init__ import MemPalaceProvider
+
+        assert MemPalaceProvider._content_quality_score("") == 0.0
+        assert MemPalaceProvider._content_quality_score("   \n  ") == 0.0
+
+    def test_short_content_gets_floor_score(self):
+        from __init__ import MemPalaceProvider
+
+        content = "Done."
+        score = MemPalaceProvider._content_quality_score(content)
+        assert score >= 0.15, f"Short content should pass, got {score}"
+
+    def test_mixed_human_and_noise_scores_moderate(self):
+        from __init__ import MemPalaceProvider
+
+        content = (
+            "Here is what we decided about the architecture.\n"
+            "We will use microservices with gRPC.\n"
+            "exit code: 0\n"
+            "successfully completed\n"
+        )
+        score = MemPalaceProvider._content_quality_score(content)
+        # Should be moderate — 2 signal lines, 2 noise lines
+        assert 0.3 <= score <= 0.7, f"Expected 0.3-0.7, got {score}"
+
+    def test_terminal_output_scores_low(self):
+        from __init__ import MemPalaceProvider
+
+        content = (
+            "stdout: Building wheel...\n"
+            "stdout: Successfully built mypackage\n"
+            "stdout: Installing collected packages\n"
+            "successfully completed\n"
+            "42 items processed\n"
+            "exit code: 0\n"
+        )
+        score = MemPalaceProvider._content_quality_score(content)
+        assert score < 0.25, f"Expected < 0.25, got {score}"
+
+
+# ======================================================================
+# v1.1.0: _save_state / _load_state  (cross-session persistence)
+# ======================================================================
+
+
+class TestStatePersistence:
+    """Tests for MemPalaceProvider._save_state and _load_state."""
+
+    def test_save_and_load_roundtrip(self, provider, tmp_path):
+        """Save state, create a fresh provider, load it back."""
+        provider._state_dir = tmp_path
+        provider._state_file = tmp_path / "provider_state.json"
+        provider._injection_history = [True, False, True, True, False]
+        provider._inject_count = 42
+        provider._session_id = "test-session-123"
+
+        provider._save_state()
+
+        # Verify file exists and is valid JSON
+        assert provider._state_file.exists()
+
+        # Create a new provider and load
+        from __init__ import MemPalaceProvider
+
+        new_provider = MemPalaceProvider(config={"binary": ""})
+        new_provider._available = True
+        new_provider._state_file = tmp_path / "provider_state.json"
+        new_provider._load_state()
+
+        assert new_provider._injection_history == [True, False, True, True, False]
+        assert new_provider._inject_count == 42
+
+    def test_load_state_file_does_not_exist(self, provider, tmp_path):
+        """Loading from non-existent file leaves defaults intact."""
+        provider._state_file = tmp_path / "nonexistent.json"
+        provider._injection_history = [True, True, True]
+        provider._inject_count = 99
+
+        provider._load_state()
+
+        # Should be unchanged — no file to load from
+        assert provider._injection_history == [True, True, True]
+        assert provider._inject_count == 99
+
+    def test_load_state_corrupted_file(self, provider, tmp_path):
+        """Corrupted state file → reset to defaults."""
+        state_file = tmp_path / "provider_state.json"
+        state_file.write_text("this is not json {{{")
+
+        provider._state_file = state_file
+        provider._injection_history = [True, True]
+        provider._inject_count = 10
+
+        provider._load_state()
+
+        # Should reset to defaults on corrupt file
+        assert provider._injection_history == []
+        assert provider._inject_count == 0
+
+    def test_save_state_skips_when_history_empty(self, provider, tmp_path):
+        """Don't write state file if there's no history to save."""
+        provider._state_dir = tmp_path
+        provider._state_file = tmp_path / "provider_state.json"
+        provider._injection_history = []
+
+        provider._save_state()
+
+        # Should not create file for empty history
+        assert not provider._state_file.exists()
+
+    def test_load_state_ignores_malformed_history_length(self, provider, tmp_path):
+        """History with >10 entries should be rejected (unexpected state)."""
+        import json
+
+        state = {
+            "injection_history": [True] * 50,
+            "inject_count": 100,
+        }
+        state_file = tmp_path / "provider_state.json"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(state))
+
+        provider._state_file = state_file
+        provider._injection_history = [True, False]
+        provider._inject_count = 5
+
+        provider._load_state()
+
+        # 50 entries > 10 → rejected, defaults preserved
+        assert provider._injection_history == [True, False]
+        assert provider._inject_count == 5

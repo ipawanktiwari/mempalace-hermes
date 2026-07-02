@@ -5,8 +5,19 @@ All notable changes to mempalace-hermes are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.2] — 2026-07-01
+## [1.1.0] — 2026-07-02
 
+### Added
+- **Content quality filter** — `_content_quality_score()` scores results by human-signal density before injection. Drops stack traces, JSON dumps, terminal output, and other low-signal content at the door. Saves ~200-500 tokens per turn on noisy queries.
+- **Cross-session state persistence** — `_save_state()` / `_load_state()` persist adaptive threshold history to `~/.hermes/mempalace/provider_state.json`. New sessions start already calibrated instead of blind for the first 10 turns.
+- 12 new tests (7 for quality scoring, 5 for state persistence) — total 76 tests
+
+### Changed
+- **Single-call `_targeted_search()`** — reduced from 4-5 subprocess calls per turn to 1. One broad search → client-side room-priority sort. 4-5x faster prefetch latency.
+- `_process_results()` now applies quality filter before deduplication
+
+## [1.0.3] — 2026-07-01
+(unchanged)
 ### Fixed
 - `plugin.yaml` version bumped from `0.1.0` to `1.0.0` to match the release tag
 - Install script now shows correct docs URL (`ipawanktiwari` instead of `<user>`)

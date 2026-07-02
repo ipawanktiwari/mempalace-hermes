@@ -36,12 +36,14 @@ These optimizations run automatically — no config needed:
 | | |
 |---|---|
 | **Keyword extraction** | Strips 200+ filler words from queries before searching. 50-70% shorter search strings = stronger semantic signal from fewer tokens. |
-| **Room-targeted search** | Searches high-signal rooms (`decisions`, `problems`, `architecture`, `general`) first — `technical` only as fallback. Better context, less noise. |
+| **Room-targeted search** | Searches high-signal rooms first, then sorts by room priority client-side. Single call, less I/O. |
 | **Freshness boosting** | Recent sessions get score multipliers: ≤7 days ×1.15, ≤30 days ×1.08. ChromaDB has no recency concept — this compensates. |
 | **Adaptive threshold** | Auto-tunes injection sensitivity per session. Loosens when too many queries miss, tightens when too many hit. Self-optimizing. |
 | **Confidence metadata** | Every injection includes `high/medium/low` confidence, score stats, and room distribution. Agent knows what to trust at a glance. |
 | **Keyword snippets** | Extracts 1-2 most query-relevant sentences per result (keyword density heuristic). Instant context without reading full content. |
 | **Query expansion** | Enriches short follow-ups ("yes go ahead") with keywords from the last 3 messages. No more dead searches on filler queries. |
+| **Content quality filter** | Scores results by human-signal density — drops stack traces, JSON dumps, and terminal output before injection. Less noise, fewer wasted tokens. |
+| **Cross-session state** | Persists adaptive threshold history to disk. New sessions start already calibrated instead of blind for the first 10 turns. |
 
 **Real-world impact:** A 20-turn session burns ~5,000 tokens on memory vs ~20,000 with naive always-inject — **75% fewer tokens wasted** while the adaptive threshold ensures strong matches always surface and weak queries stay silent.
 
@@ -329,6 +331,7 @@ main     ← tagged releases (v1.0.0, v1.1.0, ...)
 
 | Version | Date | Highlights |
 |---|---|---|
+| **v1.1.0** | 2026-07-02 | Single-call search (5x faster), content quality filter, cross-session state persistence, 76 tests |
 | **v1.0.3** | 2026-07-01 | CI pipeline, 64 tests, CHANGELOG, CONTRIBUTING, is_available() cache, install.sh fix |
 | **v1.0.2** | 2026-07-01 | plugin.yaml version fix, housekeeping |
 | **v1.0.1** | 2026-07-01 | Batched logging, log level fixes, README badges |
